@@ -19,15 +19,43 @@ const { PassThrough } = require('stream');
 const router = express.Router();
 
 // ------------------------------------------------------------
-// Helper: turn any generator into an in-memory Buffer
+// Helper: turn any generator into an in-memory Buffer.
+//
+// IMPORTANT: PDFKit documents emit their own 'error' events (e.g. when
+// text contains characters the current font can't encode) SEPARATELY
+// from the stream they're piped into. If nothing listens for 'error' on
+// the source document, Node treats it as an unhandled event and CRASHES
+// THE WHOLE PROCESS — which is what was producing the raw 500s, not a
+// clean caught error. Pass the source (docStream) as well so we catch
+// errors from either side.
 // ------------------------------------------------------------
-function streamToBuffer(stream) {
+function streamToBuffer(stream, docStream) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     stream.on('data', (c) => chunks.push(c));
     stream.on('end', () => resolve(Buffer.concat(chunks)));
     stream.on('error', reject);
+    if (docStream) docStream.on('error', reject);
   });
+}
+
+// ------------------------------------------------------------
+// Sanitizes text before it reaches PDFKit's standard fonts (Helvetica),
+// which only support the WinAnsi (Latin-1-ish) character set. AI-written
+// prose commonly includes curly quotes, em/en dashes, and ellipses that
+// fall outside that range and would otherwise throw a hard encoding
+// error mid-render. Converts the common cases to safe ASCII equivalents
+// and strips anything else outside the safe range as a last resort.
+// ------------------------------------------------------------
+function sanitizeForPDF(text) {
+  if (!text) return text;
+  return text
+    .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[^\x00-\xFF]/g, ''); // catch-all: drop anything outside WinAnsi range
 }
 
 // ------------------------------------------------------------
@@ -86,7 +114,7 @@ function parseInlineSegments(text) {
 // thin rule lines instead of literal "---".
 // ------------------------------------------------------------
 function renderMarkdownToPDF(doc, markdown) {
-  const blocks = parseMarkdownLines(markdown);
+  const blocks = parseMarkdownLines(sanitizeForPDF(markdown));
 
   for (const block of blocks) {
     if (block.type === 'rule') {
@@ -195,24 +223,27 @@ async function generatePDF(project) {
   const stream = new PassThrough();
   doc.pipe(stream);
 
-  doc.fontSize(20).font('Helvetica-Bold').fillColor('#111').text(project.title || 'B8AI Director', { align: 'center' });
+  doc.fontSize(20).font('Helvetica-Bold').fillColor('#111').text(sanitizeForPDF(project.title) || 'B8AI Director', { align: 'center' });
   doc.moveDown();
 
   if (project.content) {
     renderMarkdownToPDF(doc, project.content);
   } else {
     (project.scenes || []).forEach((scene, i) => {
-      doc.fontSize(14).fillColor('#111').font('Helvetica-Bold').text(`Scene ${i + 1}: ${scene.title || ''}`, { underline: true });
-      doc.fontSize(11).fillColor('#444').font('Helvetica').text(scene.description || '');
+      doc.fontSize(14).fillColor('#111').font('Helvetica-Bold').text(sanitizeForPDF(`Scene ${i + 1}: ${scene.title || ''}`), { underline: true });
+      doc.fontSize(11).fillColor('#444').font('Helvetica').text(sanitizeForPDF(scene.description || ''));
       if (scene.effects?.length) {
-        doc.fontSize(10).fillColor('#777').text(`Effects: ${scene.effects.join(', ')}`);
+        doc.fontSize(10).fillColor('#777').text(sanitizeForPDF(`Effects: ${scene.effects.join(', ')}`));
       }
       doc.moveDown();
     });
   }
 
   doc.end();
-  return streamToBuffer(stream);
+  // Pass `doc` too — PDFKit emits encoding/render errors on the document
+  // itself, not just the stream it's piped into. Missing this is what
+  // was crashing the whole server on certain AI-generated text.
+  return streamToBuffer(stream, doc);
 }
 
 // ------------------------------------------------------------
