@@ -7,6 +7,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(filegenRoutes);
 
+app.get('/', (req, res) => res.send('B8AI Filegen Service is running'));
 app.get('/healthz', (req, res) => res.send('ok'));
 
 const PORT = process.env.PORT || 3000;
